@@ -1,139 +1,245 @@
 #!/usr/bin/env python3
-import serial, time, statistics
 
-PORT = "/dev/ttyUSB0"
-BAUD = 115200
-SAMPLES_PER_PHASE = 60     # ~1 second if your stream is ~60 Hz
-DT = 0.005                 # small delay between reads
+import argparse
+import ast
+import glob
+import math
+import os
+import subprocess
+import sys
+import time
+from typing import List
 
-def to_s16(v: int) -> int:
-    v = int(v)
-    if v > 32767: v -= 65536
-    if v < -32768: v += 65536
-    return v
+# ---- Optional imports with friendly messages ----
+try:
+    import serial
+except Exception:
+    print("Error: missing pyserial (python3-serial). Install with: sudo apt install python3-serial")
+    sys.exit(1)
 
-def read_frame(ser):
+try:
+    from evdev import UInput, AbsInfo, ecodes
+except Exception:
+    print("Error: missing python-evdev. Install with: sudo apt install python3-evdev")
+    sys.exit(1)
+
+# --------- Config ---------
+DEFAULT_BAUD = 115200
+ABS_MIN = 0
+ABS_MAX = 255  # exported axis resolution (0..255)
+AXES = [ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_Z]
+LABELS = ["Clutch", "Gas", "Break"]  # correct order: index 1 = Gas, index 2 = Break  # per user request ("Break" used verbatim)
+BAR_WIDTH = 40
+ALPHA = 0.08  # EMA base alpha for smoothing (0..1) — lower = smoother  # EMA base alpha for smoothing (0..1) — lower = smoother
+# Top deadzone: cut off the top N percent (e.g. 3 means values >= 97% snap to 100%)
+DEADZONE_TOP_PERCENT = 3.0
+# Bottom deadzone (keep small; set to 0 to disable). We're only cutting the top by default.
+DEADZONE_BOTTOM_PERCENT = 5.0
+SERIAL_TIMEOUT = 1.0
+REDRAW_INTERVAL = 0.02  # ~50 Hz UI update
+# How aggressively the adaptive alpha should scale with change magnitude.
+# Larger values make alpha reach 1.0 sooner as the difference increases.
+ADAPTIVE_SENSITIVITY = 0.8
+# Minimum percent diff before adaptive alpha starts to increase
+DIFF_THRESHOLD = 5.0
+
+# --------- Helpers ---------
+
+def modprobe_uinput():
+    """Try to load uinput kernel module if not present."""
+    if not os.path.exists('/dev/uinput'):
+        try:
+            subprocess.run(['modprobe', 'uinput'], check=False)
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+
+def find_serial_port() -> str:
+    """Auto-detect a serial port if present (ttyUSB*, ttyACM*). Returns a path or default.
+
+    Priority: /dev/ttyUSB*, then /dev/ttyACM*, else fall back to /dev/ttyUSB0.
     """
-    Parse a line like '0:gx,gy,gz|1:gx,gy,gz|2:gx,gy,gz'
-    Return [[gx,gy,gz], [gx,gy,gz], [gx,gy,gz]] as signed ints.
+    candidates = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+    candidates = [c for c in candidates if os.path.exists(c)]
+    return candidates[0] if candidates else '/dev/ttyUSB0'
+
+
+def clear_screen():
+    # print real ANSI escape sequences so terminals render colors correctly
+    # use  (octal) which is unambiguous in many environments
+    print('\x1b[2J\x1b[H', end='')
+
+def green(text: str) -> str:
+    # return text wrapped in real ANSI color escapes (green)
+    return '\x1b[32m' + str(text) + '\x1b[0m'
+
+def render_progress_bar(pct: float, width: int) -> str:
+    """Return a colored progress bar string for percent value 0..100."""
+    pct = max(0.0, min(100.0, pct))
+    filled = int((pct / 100.0) * width)
+    bar = '█' * filled + ' ' * (width - filled)
+    return f"{green(bar[:filled])}{bar[filled:]}"
+
+
+def percent_to_abs(pct: float) -> int:
+    """Map 0..100 percent to ABS_MIN..ABS_MAX integer range."""
+    return int((max(0.0, min(100.0, pct)) / 100.0) * (ABS_MAX - ABS_MIN) + ABS_MIN)
+
+
+def compute_adaptive_alpha(base_alpha: float, diff: float) -> float:
+    """Return an adapted alpha (0..1) that increases only for sufficiently large changes.
+
+    - base_alpha: the configured baseline alpha (0..1)
+    - diff: absolute difference in percent (0..100)
+
+    Adaptive alpha stays at base_alpha for small diffs (<= DIFF_THRESHOLD). For larger diffs
+    it scales toward 1.0; ADAPTIVE_SENSITIVITY controls how quickly it approaches 1.0.
     """
-    line = ser.readline().decode("utf-8", errors="ignore").strip()
-    if not line or ":" not in line: 
-        return None
-    try:
-        gyros = []
-        for part in line.split("|"):
-            if ":" not in part: 
-                continue
-            _, vec = part.split(":", 1)
-            gx, gy, gz = (to_s16(x) for x in map(int, vec.split(",")))
-            gyros.append([gx, gy, gz])
-        if len(gyros) >= 3:
-            return gyros[:3]
-    except Exception:
-        pass
-    return None
+    if diff <= DIFF_THRESHOLD:
+        return base_alpha
+    # normalize remaining range (DIFF_THRESHOLD..100) to 0..1
+    adj = (diff - DIFF_THRESHOLD) / (100.0 - DIFF_THRESHOLD)
+    scale = min(1.0, adj * ADAPTIVE_SENSITIVITY)
+    return base_alpha + (1.0 - base_alpha) * scale
 
-def grab_phase(ser, n=SAMPLES_PER_PHASE, dt=DT):
-    vals = []  # list of [[gx,gy,gz],[...],[...]]
-    while len(vals) < n:
-        fr = read_frame(ser)
-        if fr:
-            vals.append(fr)
-        time.sleep(dt)
-    return vals
 
-def medians_per_axis(frames):
-    """Return 3x3 medians: med[gyro][axis]."""
-    med = []
-    for g in range(3):
-        axes = []
-        for a in range(3):
-            axes.append(statistics.median([f[g][a] for f in frames]))
-        med.append(axes)
-    return med
-
-def fmt(x): 
-    return f"{x:7.1f}"
-
-def analyze_pedal(name, ser):
-    print(f"\n--- {name.upper()} ---")
-    print(f"[{name}] PRESS fully and hold...")
-    press = grab_phase(ser)
-    print(f"[{name}] RELEASE fully...")
-    rel = grab_phase(ser)
-
-    press_med = medians_per_axis(press)   # 3x3
-    rel_med   = medians_per_axis(rel)     # 3x3
-
-    # delta = press - release (signed), mag = |delta|
-    delta = [[press_med[g][a] - rel_med[g][a] for a in range(3)] for g in range(3)]
-    mag   = [[abs(delta[g][a]) for a in range(3)] for g in range(3)]
-
-    # find best (g,a) by magnitude
-    best_g, best_a, best_mag = 0, 0, -1
-    for g in range(3):
-        for a in range(3):
-            if mag[g][a] > best_mag:
-                best_g, best_a, best_mag = g, a, mag[g][a]
-
-    # polarity & min/max suggestion:
-    # if press > release → normal (min=release, max=press)
-    # else inverted (min=release, max=press still works with normalize handling)
-    press_val = press_med[best_g][best_a]
-    rel_val   = rel_med[best_g][best_a]
-    suggested_min, suggested_max = rel_val, press_val  # driver can handle inverted too
-
-    # print table
-    print("\nPer-gyro per-axis medians (press / release) and delta:")
-    axes_lbl = ["X", "Y", "Z"]
-    for g in range(3):
-        row_p = "  G{} press : ".format(g) + " ".join(f"{axes_lbl[a]}={fmt(press_med[g][a])}" for a in range(3))
-        row_r = "  G{} release: ".format(g) + " ".join(f"{axes_lbl[a]}={fmt(rel_med[g][a])}"   for a in range(3))
-        row_d = "  G{} delta  : ".format(g) + " ".join(f"{axes_lbl[a]}={fmt(delta[g][a])}"     for a in range(3))
-        print(row_p); print(row_r); print(row_d)
-
-    print(f"\n[{name}] BEST → gyro={best_g}, axis={best_a} ({axes_lbl[best_a]}), |delta|={best_mag:.1f}")
-    print(f"[{name}] Suggested range: min={suggested_min:.1f}, max={suggested_max:.1f} (press-release medians)")
-
-    return {
-        "name": name,
-        "gyro": best_g,
-        "axis": best_a,
-        "min":  suggested_min,
-        "max":  suggested_max,
-        "delta": best_mag,
-    }
+# --------- Main ---------
 
 def main():
-    print(f"Opening {PORT} @ {BAUD} …")
-    with serial.Serial(PORT, BAUD, timeout=1) as ser:
-        time.sleep(1)
-        print("Reading a few frames to stabilize…")
-        _ = grab_phase(ser, n=20, dt=0.005)
+    parser = argparse.ArgumentParser(description='ESP32 pedals -> virtual joystick')
+    parser.add_argument('--port', '-p', default=None, help='Serial port (auto-detected if omitted)')
+    parser.add_argument('--baud', '-b', type=int, default=DEFAULT_BAUD, help=f'Baud rate (default {DEFAULT_BAUD})')
+    parser.add_argument('--alpha', type=float, default=ALPHA, help='Base EMA alpha (smoothing) 0..1')
+    parser.add_argument('--deadzone', type=float, default=DEADZONE_TOP_PERCENT, help='Top deadzone percent (values >= 100-deadzone snap to 100)')
+    args = parser.parse_args()
 
-        results = []
-        for pedal in ("clutch", "brake", "gas"):
-            results.append(analyze_pedal(pedal, ser))
+    alpha = max(0.0, min(1.0, args.alpha))
+    dz_top = max(0.0, min(100.0, args.deadzone))
+    dz_bottom = max(0.0, DEADZONE_BOTTOM_PERCENT)
 
-        print("\n===== SUMMARY =====")
-        for r in results:
-            print(f"{r['name']:6s} → gyro={r['gyro']}, axis={r['axis']}, "
-                  f"min={r['min']:.1f}, max={r['max']:.1f}, |delta|={r['delta']:.1f}")
+    # Detect serial port if user omitted it
+    port = args.port if args.port is not None else find_serial_port()
 
-        # Recommended PEDAL_MAP and ranges block to paste into your driver:
-        print("\nRecommended PEDAL_MAP (paste into driver):")
-        print("PEDAL_MAP = {")
-        for r in results:
-            print(f"    '{r['name']}': ({r['gyro']}, {r['axis']}),")
-        print("}")
+    # Ensure uinput exists (try to modprobe if missing)
+    modprobe_uinput()
+    if not os.path.exists('/dev/uinput'):
+        print('/dev/uinput not found — you may need to run: sudo modprobe uinput')
+        print('If running without root, you may also need to adjust uinput permissions or run with sudo.')
 
-        print("\nRecommended ranges (for optional preloading instead of recalib):")
-        for r in results:
-            print(f"{r['name']}: min={r['min']:.1f}, max={r['max']:.1f}")
+    # Capability map for three absolute axes
+    cap = {
+        ecodes.EV_ABS: [
+            (AXES[0], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
+            (AXES[1], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
+            (AXES[2], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
+        ]
+    }
 
-        print("\nNote: If a pedal feels inverted in the driver, just swap min/max there "
-              "(the normalize function supports inverted ranges).")
+    try:
+        ui = UInput(cap, name='ESP32 Pedals', version=0x3)
+    except PermissionError:
+        print('Permission error creating uinput device. Try running with sudo or enable /dev/uinput access for your user.')
+        sys.exit(1)
+    except Exception as exc:
+        print('Failed to create UInput device:', exc)
+        sys.exit(1)
+
+    # open serial
+    try:
+        ser = serial.Serial(port, args.baud, timeout=SERIAL_TIMEOUT)
+    except Exception as e:
+        print(f'Failed to open serial port {port}: {e}')
+        ui.close()
+        sys.exit(2)
+
+    smoothed = [0.0, 0.0, 0.0]
+    has_value = [False, False, False]
+    last_print = 0.0
+
+    print('Starting — press Ctrl-C to quit')
+    if os.geteuid() != 0:
+        print('Note: running without root. You may need sudo to create uinput device or access the serial port.')
+    time.sleep(0.05)
+
+    try:
+        while True:
+            now = time.time()
+            raw_line = ser.readline().decode(errors='ignore').strip()
+            parsed = None
+            if raw_line:
+                try:
+                    parsed = ast.literal_eval(raw_line)
+                    if not isinstance(parsed, (list, tuple)) or len(parsed) < 3:
+                        parsed = None
+                except Exception:
+                    parsed = None
+
+            if parsed is None:
+                values = smoothed[:]  # reuse last smoothed values
+            else:
+                values = []
+                for i in range(3):
+                    v = float(parsed[i])
+
+                    # apply bottom deadzone (optional)
+                    if v <= dz_bottom:
+                        v = 0.0
+
+                    # apply top deadzone (snap very-high values to 100)
+                    if v >= 100.0 - dz_top:
+                        v = 100.0
+
+                    # smoothing: adaptive EMA that responds faster for large changes
+                    if not has_value[i]:
+                        smoothed[i] = v
+                        has_value[i] = True
+                    else:
+                        diff = abs(v - smoothed[i])  # percent difference
+                        alpha_eff = compute_adaptive_alpha(alpha, diff)
+                        smoothed[i] = (alpha_eff * v) + ((1.0 - alpha_eff) * smoothed[i])
+
+                    values.append(smoothed[i])
+
+                # write events to virtual device
+                for i, pct in enumerate(values):
+                    ui.write(ecodes.EV_ABS, AXES[i], percent_to_abs(pct))
+                ui.syn()
+
+            # redraw UI at limited rate
+            if now - last_print >= REDRAW_INTERVAL:
+                last_print = now
+                clear_screen()
+                print('ESP32 Pedals — serial:', port, ' baud:', args.baud)
+                print()
+                if raw_line:
+                    print('raw:', raw_line)
+                else:
+                    print('raw: <no data>')
+                print()
+
+                for i, pct in enumerate(values):
+                    bar = render_progress_bar(pct, BAR_WIDTH)
+                    print(bar)
+                    print(f"{LABELS[i]} — {pct:6.2f}%")
+                    print()
+
+                sys.stdout.flush()
+
+            time.sleep(0.002)
+
+    except KeyboardInterrupt:
+        print('Exiting...')
+    finally:
+        try:
+            ui.close()
+        except Exception:
+            pass
+        try:
+            ser.close()
+        except Exception:
+            pass
+
 
 if __name__ == '__main__':
     main()
