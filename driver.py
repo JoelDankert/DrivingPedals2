@@ -27,14 +27,14 @@ except Exception:
 DEFAULT_BAUD = 115200
 ABS_MIN = 0
 ABS_MAX = 255  # exported axis resolution (0..255)
-AXES = [ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_Z]
-LABELS = ["Clutch", "Gas", "Break"]  # correct order: index 1 = Gas, index 2 = Break  # per user request ("Break" used verbatim)
+AXES = [ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_RZ]
+LABELS = ["Clutch", "Gas", "Brake"]
 BAR_WIDTH = 40
 ALPHA = 0.2  # EMA base alpha for smoothing (0..1) — lower = smoother  # EMA base alpha for smoothing (0..1) — lower = smoother
 # Top deadzone: cut off the top N percent (e.g. 3 means values >= 97% snap to 100%)
-DEADZONE_TOP_PERCENT = 3.0
+DEADZONE_TOP_PERCENT = 10.0
 # Bottom deadzone (keep small; set to 0 to disable). We're only cutting the top by default.
-DEADZONE_BOTTOM_PERCENT = 5.0
+DEADZONE_BOTTOM_PERCENT = 10.0
 SERIAL_TIMEOUT = 1.0
 REDRAW_INTERVAL = 0.02  # ~50 Hz UI update
 # How aggressively the adaptive alpha should scale with change magnitude.
@@ -133,11 +133,12 @@ def main():
             (AXES[0], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
             (AXES[1], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
             (AXES[2], AbsInfo(value=0, min=ABS_MIN, max=ABS_MAX, fuzz=0, flat=0, resolution=0)),
-        ]
+        ],
+        ecodes.EV_KEY: [ecodes.BTN_0],  # <-- Add this line
     }
 
     try:
-        ui = UInput(cap, name='ESP32 Pedals', version=0x3)
+        ui = UInput(cap, name='ESP32 Pedals', version=0x3, bustype=ecodes.BUS_USB)
     except PermissionError:
         print('Permission error creating uinput device. Try running with sudo or enable /dev/uinput access for your user.')
         sys.exit(1)
