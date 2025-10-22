@@ -30,7 +30,7 @@ ABS_MAX = 255  # exported axis resolution (0..255)
 AXES = [ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_Z]
 LABELS = ["Clutch", "Gas", "Break"]  # correct order: index 1 = Gas, index 2 = Break  # per user request ("Break" used verbatim)
 BAR_WIDTH = 40
-ALPHA = 0.08  # EMA base alpha for smoothing (0..1) — lower = smoother  # EMA base alpha for smoothing (0..1) — lower = smoother
+ALPHA = 0.2  # EMA base alpha for smoothing (0..1) — lower = smoother  # EMA base alpha for smoothing (0..1) — lower = smoother
 # Top deadzone: cut off the top N percent (e.g. 3 means values >= 97% snap to 100%)
 DEADZONE_TOP_PERCENT = 3.0
 # Bottom deadzone (keep small; set to 0 to disable). We're only cutting the top by default.
@@ -39,9 +39,9 @@ SERIAL_TIMEOUT = 1.0
 REDRAW_INTERVAL = 0.02  # ~50 Hz UI update
 # How aggressively the adaptive alpha should scale with change magnitude.
 # Larger values make alpha reach 1.0 sooner as the difference increases.
-ADAPTIVE_SENSITIVITY = 0.8
+ADAPTIVE_SENSITIVITY = 0.5
 # Minimum percent diff before adaptive alpha starts to increase
-DIFF_THRESHOLD = 5.0
+DIFF_THRESHOLD = 10.0
 
 # --------- Helpers ---------
 
